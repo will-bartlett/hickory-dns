@@ -43,6 +43,7 @@ tls-aws-lc-rs = [
 ]
 https-aws-lc-rs = [
     "hickory-resolver/https-aws-lc-rs",
+    "hickory-server/https-aws-lc-rs",
     "tls-aws-lc-rs",
     "__https",
 ]
@@ -54,7 +55,9 @@ quic-aws-lc-rs = [
 h3-aws-lc-rs = [
     "hickory-net/h3-aws-lc-rs",
     "hickory-resolver/h3-aws-lc-rs",
+    "hickory-server/h3-aws-lc-rs",
     "quic-aws-lc-rs",
+    "__h3",
 ]
 
 tls-ring = [
@@ -65,6 +68,7 @@ tls-ring = [
 ]
 https-ring = [
     "hickory-resolver/https-ring",
+    "hickory-server/https-ring",
     "tls-ring",
     "__https",
 ]
@@ -76,18 +80,26 @@ quic-ring = [
 h3-ring = [
     "hickory-net/h3-ring",
     "hickory-resolver/h3-ring",
+    "hickory-server/h3-ring",
     "quic-ring",
+    "__h3",
 ]
 
 __tls = ["dep:rustls"]
-__https = ["dep:rustls", "dep:webpki-roots"]
+__https = ["dep:rustls", "dep:webpki-roots", "dep:bytes", "dep:h2", "dep:http", "dep:tokio-rustls"]
+__h3 = ["dep:bytes", "dep:h3", "dep:h3-quinn", "dep:http"]
 
 sqlite = ["rusqlite", "hickory-server/sqlite"]
 metrics = ["hickory-server/metrics"]
 
 [dependencies]
 async-trait.workspace = true
+bytes = { workspace = true, optional = true }
 futures = { workspace = true, features = ["executor"] }
+h2 = { workspace = true, optional = true, features = ["stream"] }
+h3 = { workspace = true, optional = true }
+h3-quinn = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 once_cell.workspace = true
 rand.workspace = true
 rusqlite = { workspace = true, features = ["bundled"], optional = true }
@@ -95,6 +107,7 @@ rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 time.workspace = true
 tokio = { workspace = true, features = ["time", "rt"] }
+tokio-rustls = { workspace = true, optional = true }
 tracing.workspace = true
 hickory-proto = { workspace = true, features = ["testing", "std"] }
 hickory-net = { workspace = true, features = ["tokio"] }

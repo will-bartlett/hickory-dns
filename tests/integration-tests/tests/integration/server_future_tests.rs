@@ -301,7 +301,9 @@ async fn lazy_tcp_client(addr: SocketAddr) -> Client<TokioRuntimeProvider> {
 }
 
 #[cfg(feature = "__tls")]
-fn read_certs(cert_path: impl AsRef<Path>) -> Result<Vec<CertificateDer<'static>>, pem::Error> {
+pub(super) fn read_certs(
+    cert_path: impl AsRef<Path>,
+) -> Result<Vec<CertificateDer<'static>>, pem::Error> {
     CertificateDer::pem_file_iter(cert_path)?.collect::<Result<Vec<_>, _>>()
 }
 
@@ -369,7 +371,7 @@ async fn client_thread_www(future: impl Future<Output = Client<TokioRuntimeProvi
     }
 }
 
-fn new_catalog() -> Catalog {
+pub(super) fn new_catalog() -> Catalog {
     let example = create_example();
     let origin = example.origin().clone();
 

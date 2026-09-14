@@ -341,12 +341,14 @@ impl<T: RequestHandler> Server<T> {
     ///  to not make this too low depending on use cases.
     ///
     /// # Arguments
-    /// * `listener` - a bound TCP (needs to be on a different port from standard TCP connections) socket
+    /// * `socket` - a bound UDP socket
     /// * `timeout` - timeout duration of incoming requests, any connection that does not send
     ///   requests within this time period will be closed. In the future it should be
     ///   possible to create long-lived queries, but these should be from trusted sources
     ///   only, this would require some type of whitelisting.
     /// * `server_cert_resolver` - resolver for certificate and key used to announce to clients
+    /// * `dns_hostname` - the DNS hostname of the H3 server.
+    /// * `http_endpoint` - the HTTP endpoint of the H3 server.
     #[cfg(feature = "__h3")]
     pub fn register_h3_listener(
         &mut self,
@@ -354,12 +356,14 @@ impl<T: RequestHandler> Server<T> {
         timeout: Duration,
         server_cert_resolver: Arc<dyn ResolvesServerCert>,
         dns_hostname: Option<String>,
+        http_endpoint: String,
     ) -> io::Result<()> {
         self.join_set.spawn(h3_handler::handle_h3(
             socket,
             timeout,
             server_cert_resolver,
             dns_hostname,
+            http_endpoint,
             self.context.clone(),
         ));
         Ok(())
@@ -376,12 +380,14 @@ impl<T: RequestHandler> Server<T> {
     ///  to not make this too low depending on use cases.
     ///
     /// # Arguments
-    /// * `listener` - a bound TCP (needs to be on a different port from standard TCP connections) socket
+    /// * `socket` - a bound UDP socket
     /// * `timeout` - timeout duration of incoming requests, any connection that does not send
     ///   requests within this time period will be closed. In the future it should be
     ///   possible to create long-lived queries, but these should be from trusted sources
     ///   only, this would require some type of whitelisting.
     /// * `tls_config` - a customized ServerConfig to use for TLS.
+    /// * `dns_hostname` - the DNS hostname of the H3 server.
+    /// * `http_endpoint` - the HTTP endpoint of the H3 server.
     #[cfg(feature = "__h3")]
     pub fn register_h3_listener_with_tls_config(
         &mut self,
@@ -389,11 +395,13 @@ impl<T: RequestHandler> Server<T> {
         timeout: Duration,
         tls_config: Arc<ServerConfig>,
         dns_hostname: Option<String>,
+        http_endpoint: String,
     ) -> Result<(), NetError> {
         self.join_set.spawn(h3_handler::handle_h3_with_server(
             H3Server::with_socket_and_tls_config(socket, tls_config)?,
             timeout,
             dns_hostname,
+            http_endpoint,
             self.context.clone(),
         ));
         Ok(())
@@ -1180,6 +1188,7 @@ mod tests {
                         Duration::from_secs(1),
                         cert_key,
                         None,
+                        "/dns-query".into(),
                     )
                     .unwrap();
             }

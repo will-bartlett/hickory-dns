@@ -13,7 +13,7 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut, BytesMut};
 use futures_util::{Stream, StreamExt};
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
-use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Uri, header, uri};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, header, uri};
 use tracing::debug;
 
 use crate::error::NetError;
@@ -74,7 +74,7 @@ impl RequestContext {
 }
 
 /// Verifies the request is well-formed for the name-server and supported protocols
-pub fn verify<T>(
+fn verify<T>(
     version: Version,
     name_server: Option<&str>,
     query_path: &str,
@@ -157,6 +157,29 @@ pub fn verify<T>(
     );
 
     Ok(())
+}
+
+/// Validate an HTTP request and collect its DNS message bytes.
+pub async fn message_from<E: Into<NetError>>(
+    version: Version,
+    name_server: Option<&str>,
+    query_path: &str,
+    request: Request<impl Stream<Item = Result<impl Buf, E>> + Unpin>,
+) -> Result<BytesMut, NetError> {
+    verify(version, name_server, query_path, &request)?;
+
+    let mut content_length = None;
+    if let Some(length) = request.headers().get(CONTENT_LENGTH) {
+        let length = usize::from_str(length.to_str()?)?;
+        debug!("got message length: {}", length);
+        content_length = Some(length);
+    }
+
+    match *request.method() {
+        Method::GET => Err(format!("GET unimplemented: {}", request.method()).into()),
+        Method::POST => fetch_body(request.into_body(), content_length).await,
+        _ => Err(format!("bad method: {}", request.method()).into()),
+    }
 }
 
 /// Fetch the body of the request from the stream
@@ -266,6 +289,35 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    #[cfg(feature = "__https")]
+    async fn test_from_post() {
+        use crate::proto::op::Message;
+
+        test_support::subscribe();
+        let message = Message::query();
+        let msg_bytes = message.to_vec().unwrap();
+        let len = msg_bytes.len();
+        let stream = stream::iter([Ok::<_, NetError>(Bytes::from(msg_bytes))]);
+        let cx = RequestContext {
+            version: Version::Http2,
+            server_name: Arc::from("ns.example.com"),
+            query_path: Arc::from("/dns-query"),
+            set_headers: None,
+        };
+        let request = cx.build(len).unwrap().map(|()| stream);
+        let bytes = message_from(
+            Version::Http2,
+            Some("ns.example.com"),
+            "/dns-query",
+            request,
+        )
+        .await
+        .unwrap();
+        let msg_from_post = Message::from_vec(bytes.as_ref()).expect("bytes failed");
+        assert_eq!(message, msg_from_post);
+    }
 
     #[test]
     #[cfg(feature = "__https")]

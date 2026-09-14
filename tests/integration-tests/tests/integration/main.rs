@@ -3,6 +3,8 @@ mod chained_zone_handler_tests;
 mod client_future_tests;
 mod client_tests;
 mod dnssec_client_handle_tests;
+#[cfg(any(feature = "__https", feature = "__h3"))]
+mod doh_tests;
 mod invalid_nsec3_tests;
 mod invalid_nsec_tests;
 mod lookup_tests;
