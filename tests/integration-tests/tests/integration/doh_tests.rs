@@ -25,7 +25,7 @@ const ENDPOINT: &str = "https://ns.example.com/custom-dns";
 
 #[cfg(feature = "__https")]
 #[tokio::test]
-async fn test_https_post() {
+async fn test_https_get_and_post() {
     use rustls::pki_types::ServerName;
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsConnector;
@@ -52,11 +52,13 @@ async fn test_https_post() {
         let (mut client, driver) = h2::client::handshake(tls).await.unwrap();
         let driver = tokio::spawn(driver);
         let mut responses = Vec::new();
-        for _ in 0..2 {
-            let (request, body) = post_request();
+        for method in [Method::GET, Method::POST] {
+            let (request, body) = doh_request(method);
             client = client.ready().await.unwrap();
-            let (response, mut stream) = client.send_request(request, false).unwrap();
-            stream.send_data(body, true).unwrap();
+            let (response, mut stream) = client.send_request(request, body.is_none()).unwrap();
+            if let Some(body) = body {
+                stream.send_data(body, true).unwrap();
+            }
             let mut response = response.await.unwrap();
             let bytes = fetch_body(response.body_mut(), None).await.unwrap();
             responses.push(assert_response(&response, &bytes));
@@ -71,7 +73,7 @@ async fn test_https_post() {
 
 #[cfg(feature = "__h3")]
 #[tokio::test]
-async fn test_h3_post() {
+async fn test_h3_get_and_post() {
     use h3_quinn::quinn::{ClientConfig as QuicConfig, Endpoint, crypto::rustls::QuicClientConfig};
     use hickory_net::h3::BodyStream;
     use std::{future::poll_fn, task::Context};
@@ -107,10 +109,12 @@ async fn test_h3_post() {
         let driver = tokio::spawn(async move { poll_fn(|cx| driver.poll_close(cx)).await });
 
         let mut responses = Vec::new();
-        for _ in 0..2 {
-            let (request, body) = post_request();
+        for method in [Method::GET, Method::POST] {
+            let (request, body) = doh_request(method);
             let mut stream = client.send_request(request).await.unwrap();
-            stream.send_data(body).await.unwrap();
+            if let Some(body) = body {
+                stream.send_data(body).await.unwrap();
+            }
             stream.finish().await.unwrap();
             let response = stream.recv_response().await.unwrap();
             let bytes = fetch_body(
@@ -153,17 +157,22 @@ fn server_and_tls(alpn: &[u8]) -> (Server<Catalog>, Arc<dyn ResolvesServerCert>,
     (Server::new(new_catalog()), certificate, crypto)
 }
 
-fn post_request() -> (Request<()>, Bytes) {
-    let bytes = Bytes::from(BASE64URL_NOPAD.decode(DNS_QUERY.as_bytes()).unwrap());
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri(ENDPOINT)
-        .header(header::ACCEPT, "application/dns-message")
-        .header(header::CONTENT_TYPE, "application/dns-message")
-        .header(header::CONTENT_LENGTH, bytes.len())
-        .body(())
-        .unwrap();
-    (request, bytes)
+fn doh_request(method: Method) -> (Request<()>, Option<Bytes>) {
+    let mut request = Request::builder()
+        .method(method.clone())
+        .header(header::ACCEPT, "application/dns-message");
+    let body = if method == Method::GET {
+        request = request.uri(format!("{ENDPOINT}?dns={DNS_QUERY}"));
+        None
+    } else {
+        let bytes = Bytes::from(BASE64URL_NOPAD.decode(DNS_QUERY.as_bytes()).unwrap());
+        request = request
+            .uri(ENDPOINT)
+            .header(header::CONTENT_TYPE, "application/dns-message")
+            .header(header::CONTENT_LENGTH, bytes.len());
+        Some(bytes)
+    };
+    (request.body(()).unwrap(), body)
 }
 
 fn assert_response<T>(response: &Response<T>, bytes: &[u8]) -> Message {

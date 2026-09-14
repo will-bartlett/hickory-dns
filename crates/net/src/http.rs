@@ -104,11 +104,13 @@ fn verify<T>(
         }
     }
 
-    // TODO: switch to mime::APPLICATION_DNS when that stabilizes
-    match request.headers().get(CONTENT_TYPE).map(|v| v.to_str()) {
-        Some(Ok(ctype)) if ctype == MIME_APPLICATION_DNS => {}
-        _ => return Err("unsupported content type".into()),
-    };
+    // GET carries the DNS message in the URI, not a typed request body.
+    if request.method() != Method::GET {
+        match request.headers().get(CONTENT_TYPE).map(|v| v.to_str()) {
+            Some(Ok(ctype)) if ctype == MIME_APPLICATION_DNS => {}
+            _ => return Err("unsupported content type".into()),
+        }
+    }
 
     // TODO: switch to mime::APPLICATION_DNS when that stabilizes
     match request.headers().get(ACCEPT).map(|v| v.to_str()) {
@@ -176,10 +178,53 @@ pub async fn message_from<E: Into<NetError>>(
     }
 
     match *request.method() {
-        Method::GET => Err(format!("GET unimplemented: {}", request.method()).into()),
+        Method::GET => {
+            if content_length.is_some_and(|length| length != 0) {
+                return Err("GET body must be empty".into());
+            }
+            let message = message_from_query(request.uri().query())?;
+            let mut body = request.into_body();
+            while let Some(chunk) = body.next().await {
+                if chunk.map_err(Into::into)?.has_remaining() {
+                    return Err("GET body must be empty".into());
+                }
+            }
+            Ok(message)
+        }
         Method::POST => fetch_body(request.into_body(), content_length).await,
         _ => Err(format!("bad method: {}", request.method()).into()),
     }
+}
+
+fn message_from_query(query: Option<&str>) -> Result<BytesMut, NetError> {
+    use data_encoding::BASE64URL_NOPAD;
+
+    let query = query.ok_or("missing dns parameter")?;
+    let mut dns = None;
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if name != "dns" {
+            continue;
+        }
+        if dns.is_some() {
+            return Err("duplicate dns parameter".into());
+        }
+        dns = Some(value);
+    }
+    let dns = dns
+        .filter(|value| !value.is_empty())
+        .ok_or("missing or empty dns parameter")?;
+    let invalid_encoding = || NetError::from("invalid unpadded base64url DNS message");
+    let len = BASE64URL_NOPAD
+        .decode_len(dns.len())
+        .map_err(|_| invalid_encoding())?;
+    if len > MAX_REQUEST_SIZE {
+        return Err(NetError::RequestTooLarge);
+    }
+    let mut bytes = BytesMut::zeroed(len);
+    BASE64URL_NOPAD
+        .decode_mut(dns.as_bytes(), &mut bytes)
+        .map_err(|_| invalid_encoding())?;
+    Ok(bytes)
 }
 
 /// Fetch the body of the request from the stream
@@ -289,12 +334,66 @@ mod tests {
     };
 
     use super::*;
+    use crate::proto::{
+        op::Message,
+        rr::{Name, RecordType},
+    };
+
+    #[test]
+    fn test_from_get() {
+        // RFC 8484 section 4.1.1 includes both a simple query and one requiring
+        // the URL-safe alphabet and omission of padding.
+        for (encoded, name) in [
+            (
+                "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB",
+                "www.example.com.",
+            ),
+            (
+                concat!(
+                    "AAABAAABAAAAAAAAAWE-NjJjaGFyYWN0ZXJsYWJl",
+                    "bC1tYWtlcy1iYXNlNjR1cmwtZGlzdGluY3QtZnJvbS1z",
+                    "dGFuZGFyZC1iYXNlNjQHZXhhbXBsZQNjb20AAAEAAQ"
+                ),
+                "a.62characterlabel-makes-base64url-distinct-from-standard-base64.example.com.",
+            ),
+        ] {
+            let bytes = message_from_query(Some(&format!("dns={encoded}"))).unwrap();
+            let message = Message::from_vec(&bytes).unwrap();
+            assert_eq!(message.queries[0].name, Name::from_str(name).unwrap());
+            assert_eq!(message.queries[0].query_type, RecordType::A);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "__https")]
+    async fn test_get_large_message() {
+        use data_encoding::BASE64URL_NOPAD;
+
+        let message = vec![255; 47 * 1024];
+        let query = format!("dns={}", BASE64URL_NOPAD.encode(&message));
+        assert_eq!(read_get(&query).await.as_ref(), message);
+    }
+
+    #[cfg(feature = "__https")]
+    async fn read_get(query: &str) -> BytesMut {
+        let request = Request::get(format!("https://ns.example.com/dns-query?{query}"))
+            .version(Version::Http2.to_http())
+            .header(ACCEPT, MIME_APPLICATION_DNS)
+            .body(stream::empty::<Result<Bytes, NetError>>())
+            .unwrap();
+        message_from(
+            Version::Http2,
+            Some("ns.example.com"),
+            "/dns-query",
+            request,
+        )
+        .await
+        .unwrap()
+    }
 
     #[tokio::test]
     #[cfg(feature = "__https")]
     async fn test_from_post() {
-        use crate::proto::op::Message;
-
         test_support::subscribe();
         let message = Message::query();
         let msg_bytes = message.to_vec().unwrap();
@@ -320,6 +419,36 @@ mod tests {
     }
 
     #[test]
+    fn test_get_query_parameters() {
+        for query in ["dns=AA", "ignored=value&dns=AA&other=value", "%64ns=%41%41"] {
+            assert_eq!(message_from_query(Some(query)).unwrap().as_ref(), &[0]);
+        }
+        for query in [
+            None,
+            Some(""),
+            Some("other=AA"),
+            Some("DNS=AA"),
+            Some("dns"),
+            Some("dns="),
+            Some("dns=AA&dns=AA"),
+            Some("dns=AA&%64ns=AA"),
+            Some("dns=AA&dns"),
+            Some("dns=A"),
+            Some("dns=AB"), // Nonzero trailing bits are not canonical base64url.
+            Some("dns=AA=="),
+            Some("dns=AA%3D%3D"),
+            Some("dns=+w"),
+            Some("dns=/w"),
+            Some("dns=%2Bw"),
+            Some("dns=%"),
+            Some("dns=%GG"),
+            Some("dns=AA%00"),
+        ] {
+            assert!(message_from_query(query).is_err(), "{query:?}");
+        }
+    }
+
+    #[test]
     #[cfg(feature = "__https")]
     fn test_new_verify_h2() {
         let cx = RequestContext {
@@ -339,6 +468,54 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "__https")]
+    async fn test_content_type_required_only_for_post() {
+        for (method, valid) in [(Method::GET, true), (Method::POST, false)] {
+            let request = Request::builder()
+                .method(method)
+                .version(Version::Http2.to_http())
+                .uri("https://ns.example.com/dns-query?dns=AA")
+                .header(ACCEPT, MIME_APPLICATION_DNS)
+                .body(stream::empty::<Result<Bytes, NetError>>())
+                .unwrap();
+            assert_eq!(
+                message_from(Version::Http2, None, "/dns-query", request)
+                    .await
+                    .is_ok(),
+                valid,
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "__https")]
+    async fn test_get_body_validation() {
+        for (length, body, valid) in [
+            (None, Bytes::from_static(b"x"), false),
+            (Some(1), Bytes::new(), false),
+            (Some(0), Bytes::new(), true),
+        ] {
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .version(Version::Http2.to_http())
+                .uri("https://ns.example.com/dns-query?dns=AA")
+                .header(ACCEPT, MIME_APPLICATION_DNS);
+            if let Some(length) = length {
+                request = request.header(CONTENT_LENGTH, length);
+            }
+            let request = request
+                .body(stream::iter([Ok::<_, NetError>(body)]))
+                .unwrap();
+            assert_eq!(
+                message_from(Version::Http2, None, "/dns-query", request)
+                    .await
+                    .is_ok(),
+                valid,
+            );
+        }
     }
 
     #[test]
