@@ -21,7 +21,9 @@ use tracing::{debug, warn};
 
 use super::{
     ResponseInfo, ServerContext, default_tls_server_config, is_unrecoverable_socket_error,
-    reap_tasks, request_handler::RequestHandler, response_handler::ResponseHandler,
+    reap_tasks,
+    request_handler::RequestHandler,
+    response_handler::{ResponseHandler, http_response},
     sanitize_src_address,
 };
 use crate::{
@@ -232,9 +234,9 @@ impl ResponseHandler for HttpsResponseHandle {
             impl Iterator<Item = &'a Record> + Send + 'a,
         >,
     ) -> Result<ResponseInfo, NetError> {
-        let (info, bytes) = response.encode(Protocol::Https)?;
+        let (info, bytes, ttl) = response.encode(Protocol::Https)?;
         let bytes = Bytes::from(bytes);
-        let response = http::response(Version::Http2, bytes.len())?;
+        let response = http_response(Version::Http2, bytes.len(), ttl)?;
 
         debug!("sending response: {:#?}", response);
         let mut stream = self.0.send_response(response, false)?;

@@ -15,8 +15,10 @@ use tokio::{net, task::JoinSet, time::timeout};
 use tracing::{debug, warn};
 
 use super::{
-    ResponseInfo, ServerContext, reap_tasks, request_handler::RequestHandler,
-    response_handler::ResponseHandler, sanitize_src_address,
+    ResponseInfo, ServerContext, reap_tasks,
+    request_handler::RequestHandler,
+    response_handler::{ResponseHandler, http_response},
+    sanitize_src_address,
 };
 use crate::{
     net::{
@@ -240,9 +242,9 @@ impl ResponseHandler for H3ResponseHandle {
             impl Iterator<Item = &'a Record> + Send + 'a,
         >,
     ) -> Result<ResponseInfo, NetError> {
-        let (info, bytes) = response.encode(Protocol::H3)?;
+        let (info, bytes, ttl) = response.encode(Protocol::H3)?;
         let bytes = Bytes::from(bytes);
-        let response = http::response(Version::Http3, bytes.len())?;
+        let response = http_response(Version::Http3, bytes.len(), ttl)?;
 
         debug!("sending response: {:#?}", response);
         let stream = &mut self.0;

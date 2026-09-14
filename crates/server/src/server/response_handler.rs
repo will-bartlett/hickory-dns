@@ -14,6 +14,28 @@ use crate::{
     zone_handler::MessageResponse,
 };
 
+#[cfg(any(feature = "__https", feature = "__h3"))]
+pub(super) fn http_response(
+    version: crate::net::http::Version,
+    message_len: usize,
+    ttl: Option<u32>,
+) -> Result<http::Response<()>, NetError> {
+    use http::{HeaderValue, header};
+
+    let mut response = crate::net::http::response(version, message_len)?;
+    let cache_control = match ttl {
+        // Request handlers may return different answers to different clients.
+        Some(ttl) => format!("private, max-age={ttl}")
+            .parse()
+            .expect("a numeric TTL produces a valid HTTP header"),
+        None => HeaderValue::from_static("no-store"),
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, cache_control);
+    Ok(response)
+}
+
 /// A handler for send a response to a client
 #[async_trait::async_trait]
 pub trait ResponseHandler: Send + Sync + Unpin + 'static {
@@ -68,10 +90,35 @@ impl ResponseHandler for ResponseHandle {
             impl Iterator<Item = &'a Record> + Send + 'a,
         >,
     ) -> Result<ResponseInfo, NetError> {
-        let (info, buffer) = response.encode(self.protocol)?;
+        let (info, buffer, _) = response.encode(self.protocol)?;
         self.stream_handle
             .send(SerialMessage::new(buffer, self.dst))?;
 
         Ok(info)
+    }
+}
+
+#[cfg(all(test, any(feature = "__https", feature = "__h3")))]
+mod tests {
+    use super::*;
+    use crate::net::http::Version;
+
+    #[test]
+    fn http_cache_headers_match_across_versions() {
+        for version in [
+            #[cfg(feature = "__https")]
+            Version::Http2,
+            #[cfg(feature = "__h3")]
+            Version::Http3,
+        ] {
+            for (ttl, expected) in [
+                (Some(60), "private, max-age=60"),
+                (Some(0), "private, max-age=0"),
+                (None, "no-store"),
+            ] {
+                let response = http_response(version, 12, ttl).unwrap();
+                assert_eq!(response.headers()[http::header::CACHE_CONTROL], expected);
+            }
+        }
     }
 }

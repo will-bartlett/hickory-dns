@@ -83,7 +83,7 @@ h3-ring = [
 __tls = ["dep:rustls", "dep:tokio-rustls"]
 __https = ["dep:h2", "dep:http", "__tls"]
 __quic = ["__tls"]
-__h3 = ["dep:h3", "dep:h3-quinn", "__quic"]
+__h3 = ["dep:h3", "dep:h3-quinn", "dep:http", "__quic"]
 
 dnssec-aws-lc-rs = ["hickory-proto/dnssec-aws-lc-rs", "hickory-resolver?/dnssec-aws-lc-rs", "serde/rc", "__dnssec"]
 dnssec-ring = ["hickory-proto/dnssec-ring", "hickory-resolver?/dnssec-ring", "serde/rc", "__dnssec"]

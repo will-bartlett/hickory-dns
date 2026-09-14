@@ -76,7 +76,21 @@ where
         self.signature = Some(signature);
     }
 
-    pub(crate) fn encode(self, protocol: Protocol) -> Result<(ResponseInfo, Vec<u8>), ProtoError> {
+    pub(crate) fn encode(
+        mut self,
+        protocol: Protocol,
+    ) -> Result<(ResponseInfo, Vec<u8>, Option<u32>), ProtoError> {
+        use crate::proto::rr::RData;
+
+        fn record_ttl(record: &Record) -> u32 {
+            // RFC 2181 section 8 treats TTLs with the high bit set as zero.
+            if record.ttl > i32::MAX as u32 {
+                0
+            } else {
+                record.ttl
+            }
+        }
+
         let id = self.metadata.id;
         debug!(
             id,
@@ -96,8 +110,54 @@ where
             _ => u16::MAX,
         });
 
-        let error = match self.destructive_emit(&mut encoder) {
-            Ok(info) => return Ok((info, bytes)),
+        let cacheable = self.signature.is_none() && self.metadata.op_code == OpCode::Query;
+        let mut answer_ttl: Option<u32> = None;
+        let mut negative_ttl: Option<u32> = None;
+        let result = emit_message_parts(
+            &self.metadata,
+            &mut match self.queries {
+                Some(queries) => queries.as_emit_and_count(),
+                None => QueriesEmitAndCount::None,
+            },
+            &mut self.answers.inspect(|record| {
+                let ttl = record_ttl(record);
+                answer_ttl = Some(answer_ttl.map_or(ttl, |previous| previous.min(ttl)));
+            }),
+            &mut self.authorities.chain(self.soa).inspect(|record| {
+                if let RData::SOA(soa) = &record.data {
+                    let ttl = record_ttl(record).min(soa.minimum);
+                    negative_ttl = Some(negative_ttl.map_or(ttl, |previous| previous.min(ttl)));
+                }
+            }),
+            &mut self.additionals,
+            self.edns,
+            self.signature.as_deref(),
+            &mut encoder,
+        )
+        .map(ResponseInfo::from);
+
+        let error = match result {
+            Ok(info) => {
+                // Inspect can observe a record that does not fit; truncated
+                // responses must not get freshness derived from those records.
+                let ttl = if !cacheable || info.truncation {
+                    None
+                } else {
+                    match (info.response_code, answer_ttl, negative_ttl) {
+                        (
+                            ResponseCode::NoError | ResponseCode::NXDomain,
+                            Some(answer),
+                            Some(soa),
+                        ) => Some(answer.min(soa)),
+                        (ResponseCode::NoError, Some(answer), None) => Some(answer),
+                        (ResponseCode::NoError | ResponseCode::NXDomain, None, Some(soa)) => {
+                            Some(soa)
+                        }
+                        _ => None,
+                    }
+                };
+                return Ok((info, bytes, ttl));
+            }
             Err(error) => error,
         };
 
@@ -114,7 +174,7 @@ where
         };
 
         header.emit(&mut encoder)?;
-        Ok((ResponseInfo::from(header), bytes))
+        Ok((ResponseInfo::from(header), bytes, None))
     }
 
     /// Consumes self, and emits to the encoder.
@@ -312,6 +372,204 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_udp_response_cache_ttl() {
+        let answer = Record::from_rdata(Name::root(), 60, RData::A(Ipv4Addr::LOCALHOST.into()));
+        let (_, _, ttl) = MessageResponseBuilder::no_queries(None)
+            .build(
+                Metadata::new(0, MessageType::Response, OpCode::Query),
+                [&answer],
+                [],
+                [],
+                [],
+            )
+            .encode(Protocol::Udp)
+            .unwrap();
+        assert_eq!(ttl, Some(60));
+    }
+
+    mod cache_ttl {
+        use super::*;
+        use crate::proto::rr::rdata::{
+            CNAME, SOA, TXT,
+            tsig::{TsigAlgorithm, make_tsig_record},
+        };
+
+        fn answer(ttl: u32) -> Record {
+            Record::from_rdata(
+                Name::from_ascii("www.example.com.").unwrap(),
+                ttl,
+                RData::A(Ipv4Addr::new(192, 0, 2, 1).into()),
+            )
+        }
+
+        fn soa(ttl: u32, minimum: u32) -> Record {
+            Record::from_rdata(
+                Name::from_ascii("example.com.").unwrap(),
+                ttl,
+                RData::SOA(SOA::new(
+                    Name::from_ascii("ns.example.com.").unwrap(),
+                    Name::from_ascii("hostmaster.example.com.").unwrap(),
+                    1,
+                    3600,
+                    600,
+                    86400,
+                    minimum,
+                )),
+            )
+        }
+
+        fn encode(
+            answers: &[Record],
+            authorities: &[Record],
+            soa: &[Record],
+            response_code: ResponseCode,
+        ) -> (ResponseInfo, Vec<u8>, Option<u32>) {
+            let mut metadata = Metadata::new(0, MessageType::Response, OpCode::Query);
+            metadata.response_code = response_code;
+            MessageResponseBuilder::no_queries(None)
+                .build(metadata, answers, authorities, soa, [])
+                .encode(Protocol::Tcp)
+                .unwrap()
+        }
+
+        #[test]
+        fn minimum_remaining_answer_ttl() {
+            let mut answers = [answer(300), answer(60), answer(120)];
+            assert_eq!(
+                encode(&answers, &[], &[], ResponseCode::NoError).2,
+                Some(60)
+            );
+            for record in &mut answers {
+                record.decrement_ttl(20);
+            }
+            let (_, bytes, ttl) = encode(&answers, &[], &[], ResponseCode::NoError);
+            assert_eq!(ttl, Some(40));
+            assert_eq!(Message::from_vec(&bytes).unwrap().answers, answers);
+            for answers in [vec![answer(0)], vec![answer(60), answer(1 << 31)]] {
+                assert_eq!(encode(&answers, &[], &[], ResponseCode::NoError).2, Some(0));
+            }
+        }
+
+        #[test]
+        fn negative_ttl_from_either_authority_iterator() {
+            for code in [ResponseCode::NoError, ResponseCode::NXDomain] {
+                for (ttl, minimum, expected) in [
+                    (300, 60, 60),
+                    (30, 60, 30),
+                    (0, 60, 0),
+                    (60, 0, 0),
+                    (1 << 31, 60, 0),
+                ] {
+                    let soa = [soa(ttl, minimum)];
+                    assert_eq!(encode(&[], &soa, &[], code).2, Some(expected));
+                    assert_eq!(encode(&[], &[], &soa, code).2, Some(expected));
+                }
+            }
+        }
+
+        #[test]
+        fn negative_answer_also_bounds_alias_ttl() {
+            let cname = Record::from_rdata(
+                Name::from_ascii("www.example.com.").unwrap(),
+                300,
+                RData::CNAME(CNAME(Name::from_ascii("missing.example.com.").unwrap())),
+            );
+            for code in [ResponseCode::NoError, ResponseCode::NXDomain] {
+                assert_eq!(
+                    encode(std::slice::from_ref(&cname), &[], &[soa(60, 30)], code).2,
+                    Some(30)
+                );
+            }
+        }
+
+        #[test]
+        fn missing_ttl_and_errors_are_not_cacheable() {
+            for code in [
+                ResponseCode::NoError,
+                ResponseCode::NXDomain,
+                ResponseCode::Refused,
+                ResponseCode::ServFail,
+            ] {
+                assert_eq!(encode(&[], &[], &[], code).2, None);
+            }
+            for code in [
+                ResponseCode::NXDomain,
+                ResponseCode::Refused,
+                ResponseCode::ServFail,
+            ] {
+                assert_eq!(encode(&[answer(60)], &[], &[], code).2, None);
+            }
+        }
+
+        #[test]
+        fn signed_response_is_not_cacheable() {
+            let answers = [answer(60)];
+            let mut response = MessageResponseBuilder::no_queries(None).build(
+                Metadata::new(0, MessageType::Response, OpCode::Query),
+                &answers,
+                [],
+                [],
+                [],
+            );
+            response.set_signature(Box::new(make_tsig_record(
+                Name::root(),
+                TSIG::new(TsigAlgorithm::HmacSha256, 0, 300, vec![], 0, None, vec![]),
+            )));
+            let (info, _, ttl) = response.encode(Protocol::Tcp).unwrap();
+            assert_eq!(info.response_code, ResponseCode::NoError);
+            assert_eq!(info.counts().additionals, 1);
+            assert_eq!(ttl, None);
+        }
+
+        #[test]
+        fn non_query_response_is_not_cacheable() {
+            let answers = [answer(60)];
+            let (info, _, ttl) = MessageResponseBuilder::no_queries(None)
+                .build(
+                    Metadata::new(0, MessageType::Response, OpCode::Update),
+                    &answers,
+                    [],
+                    [],
+                    [],
+                )
+                .encode(Protocol::Tcp)
+                .unwrap();
+            assert_eq!(info.response_code, ResponseCode::NoError);
+            assert_eq!(info.counts().answers, 1);
+            assert_eq!(ttl, None);
+        }
+
+        #[test]
+        fn truncation_is_not_cacheable() {
+            let answer = answer(60);
+            let metadata = Metadata::new(0, MessageType::Response, OpCode::Query);
+            let (info, _, ttl) = MessageResponseBuilder::no_queries(None)
+                .build(metadata, iter::repeat(&answer), [], [], [])
+                .encode(Protocol::Tcp)
+                .unwrap();
+            assert!(info.truncation);
+            assert_eq!(ttl, None);
+        }
+
+        #[test]
+        fn encoding_fallback_is_not_cacheable() {
+            let invalid = Record::from_rdata(
+                Name::root(),
+                60,
+                RData::TXT(TXT::new(vec!["x".repeat(256)])),
+            );
+            let (info, bytes, ttl) =
+                encode(&[answer(60), invalid], &[], &[], ResponseCode::NoError);
+            assert_eq!(info.response_code, ResponseCode::ServFail);
+            assert_eq!(
+                Message::from_vec(&bytes).unwrap().metadata.response_code,
+                ResponseCode::ServFail
+            );
+            assert_eq!(ttl, None);
+        }
+    }
+
+    #[test]
     fn test_truncation_ridiculous_number_answers() {
         let mut buf = Vec::with_capacity(512);
         {
@@ -412,7 +670,7 @@ mod tests {
             [],
         );
 
-        let (_info, buf) = response.encode(Protocol::Udp).expect("failed to encode");
+        let (_info, buf, _) = response.encode(Protocol::Udp).expect("failed to encode");
         assert!(buf.len() <= 512, "response was {} bytes", buf.len());
 
         let response = Message::from_vec(&buf).expect("failed to decode");
@@ -446,7 +704,7 @@ mod tests {
         );
         response.set_edns(&edns);
 
-        let (_info, buf) = response.encode(Protocol::Udp).expect("failed to encode");
+        let (_info, buf, _) = response.encode(Protocol::Udp).expect("failed to encode");
         assert!(buf.len() <= 512, "response was {} bytes", buf.len());
 
         let response = Message::from_vec(&buf).expect("failed to decode");

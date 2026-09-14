@@ -185,6 +185,10 @@ fn assert_response<T>(response: &Response<T>, bytes: &[u8]) -> Message {
         response.headers()[header::CONTENT_LENGTH],
         bytes.len().to_string()
     );
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, max-age=86400"
+    );
     let message = Message::from_vec(bytes).unwrap();
     assert_eq!(message.metadata.response_code, ResponseCode::NoError);
     assert!(message.metadata.authoritative);

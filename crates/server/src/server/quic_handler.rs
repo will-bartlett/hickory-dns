@@ -202,7 +202,7 @@ impl ResponseHandler for QuicResponseHandle {
     ) -> Result<ResponseInfo, NetError> {
         // The id should always be 0 in DoQ
         response.metadata_mut().id = 0;
-        let (info, bytes) = response.encode(Protocol::Quic)?;
+        let (info, bytes, _) = response.encode(Protocol::Quic)?;
         let bytes = Bytes::from(bytes);
 
         debug!("sending quic response: {}", bytes.len());
